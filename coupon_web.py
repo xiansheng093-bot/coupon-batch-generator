@@ -8,6 +8,13 @@
 用法: python3 coupon_web.py
 """
 
+# Windows 默认 stdout 编码是 cp1252，无法输出中文；强制 UTF-8
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import http.server
 import socketserver
 import json
@@ -2050,7 +2057,7 @@ def create_example_files(output_dir='.'):
             ws.cell(row=i + 1, column=2, value=100)
         xlsx_path = os.path.join(output_dir, '券码示例.xlsx')
         wb.save(xlsx_path)
-        print('Created: ' + xlsx_path)
+        print('Created: ' + xlsx_path.encode('utf-8', errors='replace').decode('utf-8'))
 
     # 模板示例.png
     img = Image.new('RGB', (800, 500), (255, 252, 245))
@@ -2094,7 +2101,7 @@ def create_example_files(output_dir='.'):
 
     png_path = os.path.join(output_dir, '模板示例.png')
     img.save(png_path)
-    print('Created: ' + png_path)
+    print('Created: ' + png_path.encode('utf-8', errors='replace').decode('utf-8'))
 
 
 # ==================== 主函数 ====================
