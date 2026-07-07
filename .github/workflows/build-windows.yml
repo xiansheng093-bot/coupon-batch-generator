@@ -6,10 +6,6 @@ on:
   # 推送到 main 分支时自动构建
   push:
     branches: [main]
-    paths:
-      - 'coupon_web.py'
-      - 'requirements.txt'
-      - 'coupon_web.spec'
 
 jobs:
   build:
