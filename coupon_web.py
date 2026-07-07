@@ -61,6 +61,9 @@ state = {
     'template_size': None,     # (width, height)
     'codes': [],               # 券码列表
     'codes_filename': None,
+    'progress': 0,             # PDF 生成进度 0~100
+    'progress_total': 0,       # 总券码数
+    'progress_done': 0,        # 已完成数
 }
 
 
@@ -181,13 +184,15 @@ def parse_excel_file(filepath, col=0, skip_header=False):
     return codes
 
 
-def generate_pdf(codes, template_image, qr_config, text_config):
+def generate_pdf(codes, template_image, qr_config, text_config, progress_callback=None):
     """
     生成多页 PDF，每页 = 模板图片 + 对应券码的二维码 + 券码文字。
 
     坐标系：浏览器左上角原点，y 向下增加
     PDF 坐标系：左下角原点，y 向上增加
     转换：pdf_y = img_height - browser_y - element_height
+
+    progress_callback: 可选回调函数，参数 (done, total)，用于实时报告进度
     """
     # 确保模板为 RGB 模式（打印需要）
     if template_image.mode in ('RGBA', 'LA') or \
@@ -216,7 +221,8 @@ def generate_pdf(codes, template_image, qr_config, text_config):
     text_font_size = text_config['font_size']
     text_show = text_config.get('show', True)
 
-    for code in codes:
+    total = len(codes)
+    for idx, code in enumerate(codes):
         # 1. 绘制模板底图
         c.drawImage(template_reader, 0, 0, width=img_w, height=img_h)
 
@@ -254,6 +260,9 @@ def generate_pdf(codes, template_image, qr_config, text_config):
 
         c.showPage()
 
+        # 报告进度
+        if progress_callback:
+            progress_callback(idx + 1, total)
     c.save()
     buf.seek(0)
     return buf
@@ -287,7 +296,7 @@ def parse_multipart(body, boundary):
 
 # ==================== HTML 前端模板 ====================
 HTML_TEMPLATE = r'''<!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -980,6 +989,27 @@ body {
   font-weight: 600;
 }
 
+.progress-bar-container {
+  width: 260px;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #4F8EF7, #2DD4BF);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.progress-label {
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ==================== 工具类 ==================== */
 .hidden { display: none !important; }
 
@@ -1005,7 +1035,7 @@ body {
   </div>
   <div class="header-controls">
     <button class="icon-btn" id="theme-toggle" title="Theme">🌙</button>
-    <button class="icon-btn" id="lang-toggle" title="Language">EN</button>
+    <button class="icon-btn" id="lang-toggle" title="Language">中</button>
   </div>
 </header>
 
@@ -1180,7 +1210,11 @@ body {
 <!-- 加载遮罩 -->
 <div class="loading-overlay" id="loading-overlay">
   <div class="spinner"></div>
-  <div class="loading-text" id="loading-text" data-i18n="generating">正在生成 PDF，请稍候...</div>
+  <div class="loading-text" id="loading-text" data-i18n="generating">Generating PDF, please wait...</div>
+  <div class="progress-bar-container" id="progress-container" style="display:none;">
+    <div class="progress-bar" id="progress-bar" style="width:0%"></div>
+  </div>
+  <div class="progress-label" id="progress-label" style="display:none;">0%</div>
 </div>
 
 <script>
@@ -1212,6 +1246,7 @@ const I18N = {
     showText: '显示券码文字',
     generate: '生成 PDF',
     generating: '正在生成 PDF，请稍候...',
+    generatingProgress: '正在生成 PDF...',
     generateSuccess: 'PDF 生成成功！',
     generateError: '生成失败',
     noTemplate: '请先上传模板图片',
@@ -1251,6 +1286,7 @@ const I18N = {
     showText: 'Show coupon text',
     generate: 'Generate PDF',
     generating: 'Generating PDF, please wait...',
+    generatingProgress: 'Generating PDF...',
     generateSuccess: 'PDF generated successfully!',
     generateError: 'Generation failed',
     noTemplate: 'Please upload a template image first',
@@ -1267,7 +1303,7 @@ const I18N = {
 };
 
 // ==================== 状态 ====================
-let currentLang = 'zh';
+let currentLang = 'en';
 let templateLoaded = false;
 let imgWidth = 0;
 let imgHeight = 0;
@@ -1356,8 +1392,24 @@ function showLoading(text) {
   $('loading-overlay').classList.add('show');
 }
 
+function showLoadingWithProgress(text) {
+  $('loading-text').textContent = text || t('generatingProgress');
+  $('progress-container').style.display = 'block';
+  $('progress-label').style.display = 'block';
+  $('progress-bar').style.width = '0%';
+  $('progress-label').textContent = '0%';
+  $('loading-overlay').classList.add('show');
+}
+
+function updateProgress(percent) {
+  $('progress-bar').style.width = percent + '%';
+  $('progress-label').textContent = percent + '%';
+}
+
 function hideLoading() {
   $('loading-overlay').classList.remove('show');
+  $('progress-container').style.display = 'none';
+  $('progress-label').style.display = 'none';
 }
 
 // ==================== 上传券码 ====================
@@ -1698,6 +1750,8 @@ $('clear-image').addEventListener('click', async function() {
 });
 
 // ==================== 生成 PDF ====================
+let progressTimer = null;
+
 generateBtn.addEventListener('click', async function() {
   if (!templateLoaded) {
     showToast(t('noTemplate'), 'error');
@@ -1709,7 +1763,19 @@ generateBtn.addEventListener('click', async function() {
   }
 
   generateBtn.disabled = true;
-  showLoading(t('generating'));
+  // 大批量时显示进度条，小批量时显示简单 loading
+  if (codesCount > 50) {
+    showLoadingWithProgress(t('generatingProgress'));
+    progressTimer = setInterval(async function() {
+      try {
+        const resp = await fetch('/api/progress');
+        const data = await resp.json();
+        updateProgress(data.progress);
+      } catch (e) { /* 忽略轮询失败 */ }
+    }, 300);
+  } else {
+    showLoading(t('generating'));
+  }
 
   try {
     const params = {
@@ -1747,6 +1813,10 @@ generateBtn.addEventListener('click', async function() {
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
+    if (progressTimer) {
+      clearInterval(progressTimer);
+      progressTimer = null;
+    }
     generateBtn.disabled = false;
     hideLoading();
   }
@@ -1819,6 +1889,8 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
                 self._serve_qr(params)
             elif path == '/api/template':
                 self._serve_template()
+            elif path == '/api/progress':
+                self._serve_progress()
             else:
                 self.send_error_json('Not found', 404)
         except Exception as e:
@@ -1899,6 +1971,16 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_progress(self):
+        """返回当前 PDF 生成进度。"""
+        with state_lock:
+            data = {
+                'progress': state['progress'],
+                'done': state['progress_done'],
+                'total': state['progress_total'],
+            }
+        self.send_json(data)
 
     # ---------- POST 处理器 ----------
 
@@ -2000,6 +2082,10 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
 
             codes = list(state['codes'])
             template_image = state['template_image'].copy()
+            # 初始化进度
+            state['progress_total'] = len(codes)
+            state['progress_done'] = 0
+            state['progress'] = 0
 
         qr_config = {
             'x': int(params.get('qr_x', 50)),
@@ -2013,10 +2099,18 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
             'show': bool(params.get('text_show', True)),
         }
 
+        def update_progress(done, total):
+            with state_lock:
+                state['progress_done'] = done
+                state['progress_total'] = total
+                state['progress'] = int(done / total * 100) if total > 0 else 0
+
         try:
-            pdf_buf = generate_pdf(codes, template_image, qr_config, text_config)
+            pdf_buf = generate_pdf(codes, template_image, qr_config, text_config, progress_callback=update_progress)
             pdf_data = pdf_buf.getvalue()
         except Exception as e:
+            with state_lock:
+                state['progress'] = -1  # 标记失败
             self.send_error_json(str(e), 500)
             return
 
