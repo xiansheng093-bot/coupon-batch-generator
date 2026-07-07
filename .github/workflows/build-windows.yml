@@ -1,0 +1,72 @@
+name: Build Windows EXE
+
+on:
+  # 手动触发
+  workflow_dispatch:
+  # 推送到 main 分支时自动构建
+  push:
+    branches: [main]
+    paths:
+      - 'coupon_web.py'
+      - 'requirements.txt'
+      - 'coupon_web.spec'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate example files
+        run: python coupon_web.py --create-examples
+
+      - name: Build EXE with PyInstaller
+        run: pyinstaller --clean coupon_web.spec
+
+      - name: Prepare distribution
+        shell: pwsh
+        run: |
+          $distDir = "dist/优惠券批量生成器"
+          # 复制示例文件
+          if (Test-Path "券码示例.xlsx") { Copy-Item "券码示例.xlsx" $distDir }
+          if (Test-Path "模板示例.png") { Copy-Item "模板示例.png" $distDir }
+          # 写入使用说明
+          @"
+优惠券批量生成器 / Coupon Batch Generator
+==========================================
+
+使用方法:
+  1. 双击 "优惠券批量生成器.exe" 启动服务
+  2. 浏览器会自动打开 http://localhost:8888
+  3. 按 Ctrl+C 或关闭命令行窗口停止服务
+
+操作流程:
+  1. 上传 Excel 券码文件（支持 .xlsx/.xls/.csv）
+  2. 选择券码所在列（A-E）
+  3. 上传模板图片（支持 PNG/JPG/BMP）
+  4. 在预览中拖拽调整二维码和文字位置
+  5. 点击 "生成 PDF" 下载多页 PDF
+
+注意: 如果浏览器未自动打开，请手动访问 http://localhost:8888
+"@ | Out-File -FilePath "$distDir/使用说明.txt" -Encoding utf8
+
+      - name: Create ZIP archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/优惠券批量生成器" -DestinationPath "dist/优惠券批量生成器-Windows.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 优惠券批量生成器-Windows
+          path: dist/优惠券批量生成器-Windows.zip
+          retention-days: 30

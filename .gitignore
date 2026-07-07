@@ -1,0 +1,19 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.log
