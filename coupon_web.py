@@ -184,15 +184,83 @@ def parse_excel_file(filepath, col=0, skip_header=False):
     return codes
 
 
-def generate_pdf(codes, template_image, qr_config, text_config, progress_callback=None):
+# 纸张尺寸定义（单位：PDF points, 1 point = 1/72 inch）
+PAPER_SIZES = {
+    'a4': (595.27, 841.89),   # 210mm × 297mm
+    'a3': (841.89, 1190.55),  # 297mm × 420mm
+}
+
+
+def _compose_coupon_image(code, template_image, qr_config, text_config):
     """
-    生成多页 PDF，每页 = 模板图片 + 对应券码的二维码 + 券码文字。
+    合成一张完整的优惠券 PIL Image（模板 + 可选二维码 + 可选文字）。
+    用于 Grid 模式下先合成再缩放平铺。
+    """
+    img = template_image.copy()
+    draw = ImageDraw.Draw(img)
+    img_w, img_h = img.size
+
+    qr_show = qr_config.get('show', True)
+    qr_x = qr_config['x']
+    qr_y = qr_config['y']
+    qr_size = qr_config['size']
+
+    text_show = text_config.get('show', True)
+    text_x = text_config['x']
+    text_y = text_config['y']
+    text_font_size = text_config['font_size']
+
+    # 绘制二维码（可选）
+    if qr_show:
+        qr_img = generate_qr_image(code, qr_size)
+        img.paste(qr_img, (qr_x, qr_y))
+
+    # 绘制券码文字（可选）
+    if text_show:
+        font = None
+        chinese_font_path = _find_chinese_font()
+        if chinese_font_path:
+            try:
+                font = ImageFont.truetype(chinese_font_path, text_font_size)
+            except (IOError, OSError):
+                font = None
+        if font is None:
+            try:
+                font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', text_font_size)
+            except (IOError, OSError):
+                font = ImageFont.load_default()
+
+        # 半透明白色背景
+        padding = max(2, text_font_size * 0.1)
+        text_str = str(code)
+        bbox = draw.textbbox((0, 0), text_str, font=font)
+        text_w = bbox[2] - bbox[0]
+        bg_overlay = Image.new('RGBA', (int(text_w + 2*padding), int(text_font_size + 2*padding)), (255, 255, 255, 153))
+        img_rgba = img.convert('RGBA')
+        img_rgba.paste(bg_overlay, (int(text_x - padding), int(text_y - padding)), bg_overlay)
+        img = img_rgba.convert('RGB')
+        draw = ImageDraw.Draw(img)
+
+        # 绘制文字
+        draw.text((text_x, text_y), text_str, fill=(0, 0, 0), font=font)
+
+    return img
+
+
+def generate_pdf(codes, template_image, qr_config, text_config,
+                 paper_size=None, grid_rows=0, grid_cols=0,
+                 progress_callback=None):
+    """
+    生成 PDF，支持两种模式：
+
+    1) Original 模式（paper_size=None）：每页 = 模板图片原始尺寸 + QR + 文字
+    2) Grid 模式（paper_size='a4'/'a3'）：A3/A4 纸张，行列平铺优惠券
 
     坐标系：浏览器左上角原点，y 向下增加
     PDF 坐标系：左下角原点，y 向上增加
     转换：pdf_y = img_height - browser_y - element_height
 
-    progress_callback: 可选回调函数，参数 (done, total)，用于实时报告进度
+    progress_callback: 可选回调函数，参数 (done, total)
     """
     # 确保模板为 RGB 模式（打印需要）
     if template_image.mode in ('RGBA', 'LA') or \
@@ -207,9 +275,80 @@ def generate_pdf(codes, template_image, qr_config, text_config, progress_callbac
         template_image = template_image.convert('RGB')
 
     img_w, img_h = template_image.size
-    template_reader = ImageReader(template_image)
+    qr_show = qr_config.get('show', True)
+    text_show = text_config.get('show', True)
 
     buf = io.BytesIO()
+
+    # ==================== Grid 模式 ====================
+    if paper_size and paper_size in PAPER_SIZES:
+        paper_w, paper_h = PAPER_SIZES[paper_size]
+        rows = max(1, grid_rows)
+        cols = max(1, grid_cols)
+        per_page = rows * cols
+
+        # 计算单元格最大尺寸（不含边距）
+        cell_w = paper_w / cols
+        cell_h = paper_h / rows
+
+        # 缩放模板图到单元格内（保持比例）
+        scale_factor = min(cell_w / img_w, cell_h / img_h)
+        scaled_w = img_w * scale_factor
+        scaled_h = img_h * scale_factor
+
+        # 边距 = 剩余空间平分（每侧一个边距，加上列/行间隔）
+        h_margin = (paper_w - cols * scaled_w) / (cols + 1)
+        v_margin = (paper_h - rows * scaled_h) / (rows + 1)
+
+        c = canvas.Canvas(buf, pagesize=(paper_w, paper_h))
+
+        total = len(codes)
+        pages_needed = (total + per_page - 1) // per_page
+
+        for page_idx in range(pages_needed):
+            # 白色底纸
+            c.setFillColorRGB(1, 1, 1)
+            c.rect(0, 0, paper_w, paper_h, fill=1, stroke=0)
+
+            start = page_idx * per_page
+            end = min(start + per_page, total)
+
+            for slot in range(start, end):
+                row = slot % per_page // cols
+                col = slot % per_page % cols
+
+                # 合成优惠券图片
+                coupon_img = _compose_coupon_image(
+                    codes[slot], template_image, qr_config, text_config
+                )
+
+                # 缩放到目标尺寸
+                coupon_scaled = coupon_img.resize(
+                    (int(scaled_w), int(scaled_h)), Image.LANCZOS
+                )
+                coupon_reader = ImageReader(coupon_scaled)
+
+                # PDF 坐标（左下角原点，y 向上）
+                x_pos = h_margin + col * (scaled_w + h_margin)
+                # 行号 0 在最上方 → PDF y 最高
+                y_pos = paper_h - v_margin - row * (scaled_h + v_margin) - scaled_h
+
+                c.drawImage(coupon_reader, x_pos, y_pos,
+                            width=scaled_w, height=scaled_h)
+
+            c.showPage()
+
+            # 报告进度
+            if progress_callback:
+                done = min(end, total)
+                progress_callback(done, total)
+
+        c.save()
+        buf.seek(0)
+        return buf
+
+    # ==================== Original 模式 ====================
+    template_reader = ImageReader(template_image)
     c = canvas.Canvas(buf, pagesize=(img_w, img_h))
 
     qr_x = qr_config['x']
@@ -219,26 +358,23 @@ def generate_pdf(codes, template_image, qr_config, text_config, progress_callbac
     text_x = text_config['x']
     text_y = text_config['y']
     text_font_size = text_config['font_size']
-    text_show = text_config.get('show', True)
 
     total = len(codes)
     for idx, code in enumerate(codes):
         # 1. 绘制模板底图
         c.drawImage(template_reader, 0, 0, width=img_w, height=img_h)
 
-        # 2. 生成并绘制二维码
-        qr_img = generate_qr_image(code, qr_size)
-        qr_reader = ImageReader(qr_img)
-        # 坐标转换：浏览器 y → PDF y
-        pdf_qr_y = img_h - qr_y - qr_size
-        c.drawImage(qr_reader, qr_x, pdf_qr_y, width=qr_size, height=qr_size)
+        # 2. 生成并绘制二维码（可选）
+        if qr_show:
+            qr_img = generate_qr_image(code, qr_size)
+            qr_reader = ImageReader(qr_img)
+            pdf_qr_y = img_h - qr_y - qr_size
+            c.drawImage(qr_reader, qr_x, pdf_qr_y, width=qr_size, height=qr_size)
 
         # 3. 绘制券码文字（可选、可选中复制）
         if text_show:
-            # drawString 的 y 是基线位置
             pdf_text_y = img_h - text_y - text_font_size
 
-            # 绘制半透明白色背景
             text_w = stringWidth(str(code), "Helvetica", text_font_size)
             padding = max(2, text_font_size * 0.1)
             c.saveState()
@@ -253,16 +389,15 @@ def generate_pdf(codes, template_image, qr_config, text_config, progress_callbac
             )
             c.restoreState()
 
-            # 绘制文字（真实文字，非图片像素，可选中复制）
             c.setFillColorRGB(0, 0, 0)
             c.setFont("Helvetica", text_font_size)
             c.drawString(text_x, pdf_text_y, str(code))
 
         c.showPage()
 
-        # 报告进度
         if progress_callback:
             progress_callback(idx + 1, total)
+
     c.save()
     buf.seek(0)
     return buf
@@ -643,6 +778,47 @@ body {
 .form-grid .form-item input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+/* Select 下拉框 */
+select {
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--transition);
+  width: 100%;
+  cursor: pointer;
+}
+
+select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-light);
+}
+
+/* 超尺寸警告 */
+.size-warning {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(255, 107, 107, 0.12);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: #ff6b6b;
+  font-weight: 600;
+}
+
+/* 网格预览 canvas */
+.grid-preview-canvas {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  max-width: 100%;
 }
 
 /* 信息展示 */
@@ -1125,7 +1301,13 @@ body {
           <span class="dot dot-qr"></span>
           <span data-i18n="qrPosition">二维码</span>
         </div>
-        <div class="form-grid">
+        <div class="form-row" style="margin-bottom:8px;">
+          <label>
+            <input type="checkbox" id="show-qr" checked>
+            <span data-i18n="showQR">显示二维码</span>
+          </label>
+        </div>
+        <div class="form-grid" id="qr-config-fields">
           <div class="form-item">
             <label>X</label>
             <input type="number" id="qr-x" value="50" min="0">
@@ -1167,6 +1349,36 @@ body {
             <span data-i18n="showText">显示券码文字</span>
           </label>
         </div>
+      </div>
+
+      <!-- 纸张尺寸与网格配置 -->
+      <div class="config-section">
+        <div class="config-section-title">
+          <span>📄</span>
+          <span data-i18n="paperSize">纸张尺寸</span>
+        </div>
+        <div class="form-item" style="margin-bottom:8px;">
+          <select id="paper-select">
+            <option value="" data-i18n-option="paperOriginal">原图尺寸</option>
+            <option value="a4" data-i18n-option="paperA4">A4 (210×297mm)</option>
+            <option value="a3" data-i18n-option="paperA3">A3 (297×420mm)</option>
+          </select>
+        </div>
+        <div class="form-grid hidden" id="grid-config">
+          <div class="form-item">
+            <label data-i18n="gridRows">每页行数</label>
+            <input type="number" id="grid-rows" value="2" min="1" max="20">
+          </div>
+          <div class="form-item">
+            <label data-i18n="gridCols">每页列数</label>
+            <input type="number" id="grid-cols" value="3" min="1" max="20">
+          </div>
+        </div>
+        <div class="info-box hidden" id="grid-info" style="margin-top:8px;font-size:13px;">
+          <span data-i18n="gridPerPage">每页铺满</span> <span id="grid-per-page">6</span>
+          · <span data-i18n="gridPages">共需页数</span> <span id="grid-pages">1</span>
+        </div>
+        <div class="size-warning hidden" id="size-warning" data-i18n="sizeWarning">图片缩放后太小</div>
       </div>
     </div>
 
@@ -1240,10 +1452,20 @@ const I18N = {
     step3Title: '排版定位',
     step3Desc: '拖拽调整二维码和文字位置，所见即所得',
     qrPosition: '二维码',
+    showQR: '显示二维码',
     textPosition: '券码文字',
     size: '大小',
     fontSize: '字号',
     showText: '显示券码文字',
+    paperSize: '纸张尺寸',
+    paperOriginal: '原图尺寸',
+    paperA4: 'A4 (210×297mm)',
+    paperA3: 'A3 (297×420mm)',
+    gridRows: '每页行数',
+    gridCols: '每页列数',
+    gridPerPage: '每页铺满',
+    gridPages: '共需页数',
+    sizeWarning: '图片缩放后太小，建议减少行列数或使用更大纸张',
     generate: '生成 PDF',
     generating: '正在生成 PDF，请稍候...',
     generatingProgress: '正在生成 PDF...',
@@ -1280,10 +1502,20 @@ const I18N = {
     step3Title: 'Position & Layout',
     step3Desc: 'Drag to adjust QR and text position',
     qrPosition: 'QR Code',
+    showQR: 'Show QR code',
     textPosition: 'Coupon Text',
     size: 'Size',
     fontSize: 'Font',
     showText: 'Show coupon text',
+    paperSize: 'Paper Size',
+    paperOriginal: 'Original Size',
+    paperA4: 'A4 (210×297mm)',
+    paperA3: 'A3 (297×420mm)',
+    gridRows: 'Rows per page',
+    gridCols: 'Cols per page',
+    gridPerPage: 'Per page',
+    gridPages: 'Total pages',
+    sizeWarning: 'Image too small after scaling. Reduce rows/cols or use larger paper.',
     generate: 'Generate PDF',
     generating: 'Generating PDF, please wait...',
     generatingProgress: 'Generating PDF...',
@@ -1312,8 +1544,11 @@ let codesCount = 0;
 let codesPreview = [];
 
 // 配置（图像像素坐标）
-let qrConfig = { x: 50, y: 50, size: 100 };
+let qrConfig = { x: 50, y: 50, size: 100, show: true };
 let textConfig = { x: 50, y: 200, fontSize: 24, show: true };
+let paperSize = '';   // '' | 'a4' | 'a3'
+let gridRows = 2;
+let gridCols = 3;
 
 // ==================== DOM 引用 ====================
 const $ = id => document.getElementById(id);
@@ -1332,6 +1567,15 @@ const generateBtn = $('generate-btn');
 const themeToggle = $('theme-toggle');
 const langToggle = $('lang-toggle');
 const dragHint = $('drag-hint');
+const showQRCheckbox = $('show-qr');
+const showTextCheckbox = $('show-text');
+const qrConfigFields = $('qr-config-fields');
+const paperSelect = $('paper-select');
+const gridConfig = $('grid-config');
+const gridInfoBox = $('grid-info');
+const gridPerPage = $('grid-per-page');
+const gridPagesCount = $('grid-pages');
+const sizeWarning = $('size-warning');
 
 // ==================== i18n 应用 ====================
 function t(key) {
@@ -1371,7 +1615,191 @@ themeToggle.addEventListener('click', () => {
 langToggle.addEventListener('click', () => {
   currentLang = currentLang === 'zh' ? 'en' : 'zh';
   applyI18n();
+  // 更新 select option 文字
+  updatePaperOptions();
 });
+
+// ==================== QR 开关 ====================
+showQRCheckbox.addEventListener('change', function() {
+  qrConfig.show = this.checked;
+  if (this.checked) {
+    qrConfigFields.classList.remove('hidden');
+    qrElement.style.display = '';
+  } else {
+    qrConfigFields.classList.add('hidden');
+    qrElement.style.display = 'none';
+  }
+  updateGridPreview();
+});
+
+// ==================== 纸张与网格 ====================
+paperSelect.addEventListener('change', function() {
+  paperSize = this.value;
+  if (paperSize) {
+    gridConfig.classList.remove('hidden');
+    gridInfoBox.classList.remove('hidden');
+    gridInfoBox.style.display = 'flex';
+  } else {
+    gridConfig.classList.add('hidden');
+    gridInfoBox.classList.add('hidden');
+    sizeWarning.classList.add('hidden');
+  }
+  updateGridInfo();
+  updateGridPreview();
+});
+
+$('grid-rows').addEventListener('change', function() {
+  gridRows = Math.max(1, parseInt(this.value) || 1);
+  this.value = gridRows;
+  updateGridInfo();
+  updateGridPreview();
+});
+
+$('grid-cols').addEventListener('change', function() {
+  gridCols = Math.max(1, parseInt(this.value) || 1);
+  this.value = gridCols;
+  updateGridInfo();
+  updateGridPreview();
+});
+
+function updatePaperOptions() {
+  const options = paperSelect.options;
+  options[0].text = t('paperOriginal');
+  options[1].text = t('paperA4');
+  options[2].text = t('paperA3');
+}
+
+function updateGridInfo() {
+  if (!paperSize || !templateLoaded) {
+    gridInfoBox.classList.add('hidden');
+    sizeWarning.classList.add('hidden');
+    return;
+  }
+  const perPage = gridRows * gridCols;
+  const pages = Math.ceil(codesCount / perPage) || 1;
+  gridPerPage.textContent = perPage;
+  gridPagesCount.textContent = pages;
+  gridInfoBox.classList.remove('hidden');
+  gridInfoBox.style.display = 'flex';
+
+  // 尺寸验证
+  validateGridSize();
+}
+
+async function validateGridSize() {
+  if (!paperSize || !templateLoaded) return;
+  try {
+    const resp = await fetch('/api/grid-info?paper=' + paperSize + '&rows=' + gridRows + '&cols=' + gridCols);
+    const data = await resp.json();
+    if (data.error) {
+      sizeWarning.textContent = data.error;
+      sizeWarning.classList.remove('hidden');
+    } else if (data.too_small) {
+      sizeWarning.textContent = t('sizeWarning');
+      sizeWarning.classList.remove('hidden');
+    } else {
+      sizeWarning.classList.add('hidden');
+    }
+  } catch (e) {
+    // 忽略验证失败
+  }
+}
+
+// ==================== 网格预览 ====================
+function updateGridPreview() {
+  const canvasEl = $('grid-preview-canvas');
+  if (!paperSize || !templateLoaded) {
+    if (canvasEl) canvasEl.remove();
+    return;
+  }
+
+  // 创建或获取 canvas
+  if (!canvasEl) {
+    const canvas = document.createElement('canvas');
+    canvas.id = 'grid-preview-canvas';
+    canvas.className = 'grid-preview-canvas';
+    previewContainer.appendChild(canvas);
+  }
+  const canvas = $('grid-preview-canvas');
+  const ctx = canvas.getContext('2d');
+
+  // A4/A3 尺寸比（用于 canvas 预览缩放）
+  const paperSizes = { a4: [595, 842], a3: [842, 1191] };
+  const pw = paperSizes[paperSize][0];
+  const ph = paperSizes[paperSize][1];
+
+  // Canvas 缩放到合适预览大小
+  const previewMaxW = previewContainer.clientWidth - 20;
+  const previewMaxH = previewContainer.clientHeight - 20;
+  const canvasScale = Math.min(previewMaxW / pw, previewMaxH / ph, 1);
+  canvas.width = pw * canvasScale;
+  canvas.height = ph * canvasScale;
+
+  // 白色底纸
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // 计算网格参数
+  const cellW = pw / gridCols;
+  const cellH = ph / gridRows;
+  const imgScale = Math.min(cellW / imgWidth, cellH / imgHeight);
+  const scaledW = imgWidth * imgScale;
+  const scaledH = imgHeight * imgScale;
+  const hMargin = (pw - gridCols * scaledW) / (gridCols + 1);
+  const vMargin = (ph - gridRows * scaledH) / (gridRows + 1);
+
+  // 绘制每个单元格位置
+  const perPage = gridRows * gridCols;
+  const numToShow = Math.min(perPage, codesCount || perPage);
+
+  for (let i = 0; i < numToShow; i++) {
+    const row = Math.floor(i / gridCols);
+    const col = i % gridCols;
+
+    const x = (hMargin + col * (scaledW + hMargin)) * canvasScale;
+    const y = (vMargin + row * (scaledH + vMargin)) * canvasScale;
+
+    // 绘制模板缩略图
+    ctx.drawImage(templateImg, x, y, scaledW * canvasScale, scaledH * canvasScale);
+
+    // QR 小方块标记
+    if (qrConfig.show) {
+      const qrS = qrConfig.size * imgScale * canvasScale;
+      const qrX = (hMargin + col * (scaledW + hMargin) + qrConfig.x * imgScale) * canvasScale;
+      const qrY = (vMargin + row * (scaledH + vMargin) + qrConfig.y * imgScale) * canvasScale;
+      ctx.fillStyle = 'rgba(74, 158, 255, 0.3)';
+      ctx.fillRect(qrX, qrY, qrS, qrS);
+    }
+
+    // 文字标记
+    if (textConfig.show) {
+      const textS = textConfig.fontSize * imgScale * canvasScale;
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.font = Math.max(8, textS) + 'px sans-serif';
+      const textX = (hMargin + col * (scaledW + hMargin) + textConfig.x * imgScale) * canvasScale;
+      const textY = (vMargin + row * (scaledH + vMargin) + textConfig.y * imgScale) * canvasScale + textS;
+      ctx.fillText(codesPreview[i] || 'CODE', textX, textY);
+    }
+  }
+
+  // 绘制网格线（虚线）
+  ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+  ctx.lineWidth = 0.5;
+  ctx.setLineDash([4, 4]);
+  for (let r = 1; r < gridRows; r++) {
+    ctx.beginPath();
+    ctx.moveTo(0, r * ph / gridRows * canvasScale);
+    ctx.lineTo(canvas.width, r * ph / gridRows * canvasScale);
+    ctx.stroke();
+  }
+  for (let c = 1; c < gridCols; c++) {
+    ctx.beginPath();
+    ctx.moveTo(c * pw / gridCols * canvasScale, 0);
+    ctx.lineTo(c * pw / gridCols * canvasScale, canvas.height);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
 
 // ==================== Toast 通知 ====================
 function showToast(message, type = 'info') {
@@ -1712,6 +2140,7 @@ bindInput('text-size', textConfig, 'fontSize', 'text');
 $('show-text').addEventListener('change', function() {
   textConfig.show = this.checked;
   updateTextDisplay();
+  updateGridPreview();
 });
 
 // ==================== 清空操作 ====================
@@ -1782,10 +2211,14 @@ generateBtn.addEventListener('click', async function() {
       qr_x: Math.round(qrConfig.x),
       qr_y: Math.round(qrConfig.y),
       qr_size: Math.round(qrConfig.size),
+      qr_show: qrConfig.show,
       text_x: Math.round(textConfig.x),
       text_y: Math.round(textConfig.y),
       text_font_size: Math.round(textConfig.fontSize),
-      text_show: textConfig.show
+      text_show: textConfig.show,
+      paper_size: paperSize || '',
+      grid_rows: gridRows,
+      grid_cols: gridCols
     };
 
     const resp = await fetch('/api/generate', {
@@ -1850,6 +2283,7 @@ makeResizable($('text-resize'), textConfig, 'text');
 
 initTheme();
 applyI18n();
+updatePaperOptions();
 </script>
 
 </body>
@@ -1891,6 +2325,8 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
                 self._serve_template()
             elif path == '/api/progress':
                 self._serve_progress()
+            elif path == '/api/grid-info':
+                self._serve_grid_info(params)
             else:
                 self.send_error_json('Not found', 404)
         except Exception as e:
@@ -1981,6 +2417,56 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
                 'total': state['progress_total'],
             }
         self.send_json(data)
+
+    def _serve_grid_info(self, params):
+        """计算网格布局参数，返回给前端用于预览。"""
+        paper_name = params.get('paper', [''])[0]
+        rows = int(params.get('rows', [0])[0])
+        cols = int(params.get('cols', [0])[0])
+
+        if paper_name not in PAPER_SIZES:
+            self.send_json({'error': 'Invalid paper size'})
+            return
+        if rows < 1 or cols < 1:
+            self.send_json({'error': 'Rows and cols must be >= 1'})
+            return
+
+        paper_w, paper_h = PAPER_SIZES[paper_name]
+
+        with state_lock:
+            if not state['template_image']:
+                self.send_json({'error': 'No template image'})
+                return
+            img_w, img_h = state['template_image'].size
+
+        cell_w = paper_w / cols
+        cell_h = paper_h / rows
+        scale_factor = min(cell_w / img_w, cell_h / img_h)
+        scaled_w = img_w * scale_factor
+        scaled_h = img_h * scale_factor
+
+        h_margin = (paper_w - cols * scaled_w) / (cols + 1)
+        v_margin = (paper_h - rows * scaled_h) / (rows + 1)
+
+        # 检查是否太小
+        too_small = (img_w * scale_factor < 30 or img_h * scale_factor < 30)
+
+        self.send_json({
+            'paper_w': paper_w,
+            'paper_h': paper_h,
+            'img_w': img_w,
+            'img_h': img_h,
+            'scale_factor': scale_factor,
+            'scaled_w': scaled_w,
+            'scaled_h': scaled_h,
+            'cell_w': cell_w,
+            'cell_h': cell_h,
+            'h_margin': h_margin,
+            'v_margin': v_margin,
+            'per_page': rows * cols,
+            'too_small': too_small,
+            'error': None,
+        })
 
     # ---------- POST 处理器 ----------
 
@@ -2087,10 +2573,34 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
             state['progress_done'] = 0
             state['progress'] = 0
 
+        # 纸张与网格参数
+        paper_size = params.get('paper_size', None)  # None / 'a4' / 'a3'
+        grid_rows = int(params.get('grid_rows', 0))
+        grid_cols = int(params.get('grid_cols', 0))
+
+        # Grid 模式尺寸验证
+        if paper_size and paper_size in PAPER_SIZES:
+            if grid_rows < 1 or grid_cols < 1:
+                self.send_error_json('Grid rows and cols must be >= 1', 400)
+                return
+            paper_w, paper_h = PAPER_SIZES[paper_size]
+            img_w, img_h = template_image.size
+            cell_w = paper_w / grid_cols
+            cell_h = paper_h / grid_rows
+            # 检查缩放后图片是否仍有合理大小（至少 30pt）
+            scale_factor = min(cell_w / img_w, cell_h / img_h)
+            if img_w * scale_factor < 30 or img_h * scale_factor < 30:
+                self.send_error_json(
+                    'Image too small after scaling (%.1fx%.1fpt). Reduce rows/cols or use larger paper.' % (img_w * scale_factor, img_h * scale_factor),
+                    400
+                )
+                return
+
         qr_config = {
             'x': int(params.get('qr_x', 50)),
             'y': int(params.get('qr_y', 50)),
             'size': int(params.get('qr_size', 100)),
+            'show': bool(params.get('qr_show', True)),
         }
         text_config = {
             'x': int(params.get('text_x', 50)),
@@ -2106,7 +2616,9 @@ class CouponHandler(http.server.BaseHTTPRequestHandler):
                 state['progress'] = int(done / total * 100) if total > 0 else 0
 
         try:
-            pdf_buf = generate_pdf(codes, template_image, qr_config, text_config, progress_callback=update_progress)
+            pdf_buf = generate_pdf(codes, template_image, qr_config, text_config,
+                                   paper_size=paper_size, grid_rows=grid_rows, grid_cols=grid_cols,
+                                   progress_callback=update_progress)
             pdf_data = pdf_buf.getvalue()
         except Exception as e:
             with state_lock:
